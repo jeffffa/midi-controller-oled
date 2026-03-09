@@ -1,5 +1,6 @@
 4 knappar, Bluetooth till Onsong/ipad, och ESP-Now till Autostomp samtidigt.
 
+Raw midi över bluetooth och ESP-now
 Wifi för inställningar
 
 
