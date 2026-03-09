@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include "esp_coexist.h"
 
 // --- KONFIGURATION ---
 const int NUM_BUTTONS = 4;
@@ -137,6 +138,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     Serial.println("BLE Device Disconnected");
     deviceConnected = false;
     updateLed(false);
+    NimBLEDevice::getAdvertising()->start();
   }
 };
 
@@ -755,10 +757,25 @@ void handleRoot() {
     msg += "<a href='/pair' class='btn-pair'>PAIR DEVICE</a>";
     s.replace("%PAIR_STATUS%", msg);
   } else {
-    s.replace("%PAIR_STATUS%", "<p style='color:#666; font-style:italic'>Press "
-                               "pair button on receiver...</p>");
+    s.replace("%PAIR_STATUS%", "<p style='color:#666; font-style:italic'>No device found.</p>"
+                               "<a href='/scan' class='btn-pair'>SCAN FOR AUTOSTOMP</a>");
   }
   server.send(200, "text/html", s);
+}
+
+void OnPairingRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
+int scanForAutostomp();
+
+void handleScan() {
+  newDeviceFound = false;
+  int ch = scanForAutostomp();
+  if (ch > 0 && newDeviceFound) {
+    wifiChannel = ch;
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(200, "text/html", "<p>No Autostomp found.</p><a href='/'>Back</a>");
+  }
 }
 
 void handleSave() {
@@ -888,63 +905,60 @@ volatile bool scanFoundDevice = false;
 volatile uint8_t scanFoundMAC[6];
 
 void onScanRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-  // Any ESP-NOW packet means we found a device on this channel
-  scanFoundDevice = true;
-  memcpy((void *)scanFoundMAC, mac_addr, 6);
+  if (len == sizeof(struct_pairing)) {
+    struct_pairing pkt;
+    memcpy(&pkt, incomingData, sizeof(pkt));
+    if (pkt.msgType == 1) {
+      scanFoundDevice = true;
+      memcpy((void *)scanFoundMAC, mac_addr, 6);
+      foundName = String(pkt.name);
+      memcpy(foundMAC, mac_addr, 6);
+      newDeviceFound = true;
+    }
+  } else {
+    // Fallback: accept any packet as a hit (äldre firmware)
+    scanFoundDevice = true;
+    memcpy((void *)scanFoundMAC, mac_addr, 6);
+  }
 }
 
 int scanForAutostomp() {
-  Serial.println("Scanning for Autostomp...");
+  // Autostomp-BLE kör alltid ESP-NOW på kanal 1 (låst i espnow_init).
+  // AP-läge tillåter inte kanalhopp — pinga bara kanal 1.
+  Serial.println("Scanning for Autostomp on ch 1...");
   scanFoundDevice = false;
+  newDeviceFound = false;
 
-  // Save current ESP-NOW state
-  esp_now_deinit();
+  esp_now_register_recv_cb(esp_now_recv_cb_t(onScanRecv));
 
-  for (int ch = 1; ch <= 11; ch++) {
-    Serial.printf("Trying channel %d...\n", ch);
+  uint8_t broadcastAddr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastAddr, 6);
+  peer.channel = 1;
+  peer.encrypt = false;
+  if (!esp_now_is_peer_exist(broadcastAddr))
+    esp_now_add_peer(&peer);
 
-    // Set channel
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-
-    // Init ESP-NOW on this channel
-    if (esp_now_init() != ESP_OK)
-      continue;
-    esp_now_register_recv_cb(esp_now_recv_cb_t(onScanRecv));
-
-    // Send broadcast to trigger response
-    uint8_t broadcastAddr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, broadcastAddr, 6);
-    peer.channel = ch;
-    peer.encrypt = false;
-    if (!esp_now_is_peer_exist(broadcastAddr)) {
-      esp_now_add_peer(&peer);
-    }
-
-    // Send a ping
+  // Skicka flera pingar för att öka chansen att Autostomp tar emot
+  for (int i = 0; i < 5; i++) {
     struct_pairing ping;
-    ping.msgType = 99; // Scan ping
+    ping.msgType = 99;
     strncpy(ping.name, "MIDI-SCAN", 31);
     esp_now_send(broadcastAddr, (uint8_t *)&ping, sizeof(ping));
 
-    // Wait for response
     unsigned long startWait = millis();
     while (millis() - startWait < 200) {
       delay(10);
       if (scanFoundDevice) {
-        Serial.printf("Found device on channel %d!\n", ch);
-        esp_now_deinit();
-        return ch;
+        Serial.println("Found Autostomp!");
+        esp_now_register_recv_cb(esp_now_recv_cb_t(OnPairingRecv));
+        return 1;
       }
     }
-
-    esp_now_del_peer(broadcastAddr);
-    esp_now_deinit();
   }
 
-  Serial.println("No device found during scan");
+  esp_now_register_recv_cb(esp_now_recv_cb_t(OnPairingRecv));
+  Serial.println("No Autostomp found");
   return -1;
 }
 
@@ -973,13 +987,30 @@ void handleReboot() {
 }
 void OnPairingRecv(const uint8_t *mac_addr, const uint8_t *incomingData,
                    int len) {
-  if (len == sizeof(pairingData)) {
-    memcpy(&pairingData, incomingData, sizeof(pairingData));
-    if (pairingData.msgType == 1) {
-      newDeviceFound = true;
-      memcpy(foundMAC, mac_addr, 6);
-      foundName = String(pairingData.name);
-    }
+  Serial.printf("ESP-NOW rx: len=%d\n", len);
+  if (len != sizeof(pairingData)) return;
+  memcpy(&pairingData, incomingData, sizeof(pairingData));
+  if (pairingData.msgType == 1) {
+    // CONFIG MODE: Autostomp svarade på vår scan
+    newDeviceFound = true;
+    memcpy(foundMAC, mac_addr, 6);
+    foundName = String(pairingData.name);
+  } else if (pairingData.msgType == 1) {
+    // LIVE MODE: Autostomp svarade på vår ping — spara MAC
+    memcpy(receiverAddress, mac_addr, 6);
+    memcpy(foundMAC, mac_addr, 6);
+    newDeviceFound = true;
+    preferences.begin("midi_cfg", false);
+    preferences.putBytes("rx", receiverAddress, 6);
+    preferences.end();
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac_addr, 6);
+    peer.channel = 1;
+    peer.encrypt = false;
+    if (!esp_now_is_peer_exist(mac_addr))
+      esp_now_add_peer(&peer);
+    Serial.printf("Autostomp found: %02X:%02X:%02X:%02X:%02X:%02X\n",
+      mac_addr[0],mac_addr[1],mac_addr[2],mac_addr[3],mac_addr[4],mac_addr[5]);
   }
 }
 
@@ -1241,8 +1272,9 @@ void checkButton(int btnIndex) {
 
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  delay(1000);
   Serial.begin(115200);
+  delay(3000);
+  Serial.println("=== BOOT ===");
   ledcSetup(PWM_CHAN, PWM_FREQ, PWM_RES);
   ledcAttachPin(ledPin, PWM_CHAN);
   updateLed(false);
@@ -1292,7 +1324,7 @@ void setup() {
     currentMode = MODE_CONFIG;
     Serial.println("CONFIG MODE");
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("MIDI-PEDAL-PRO", NULL, wifiChannel, 0, 4);
+    WiFi.softAP("MIDI-PEDAL-PRO", NULL, 1, 0, 4); // kanal 1 = samma som Autostomp ESP-NOW
     if (esp_now_init() == ESP_OK) {
       esp_now_register_recv_cb(esp_now_recv_cb_t(OnPairingRecv));
       memcpy(peerInfo.peer_addr, receiverAddress, 6);
@@ -1307,6 +1339,7 @@ void setup() {
     server.on("/savech", handleSaveChannel);
     server.on("/preset", handlePreset);
     server.on("/pair", handlePair);
+    server.on("/scan", handleScan);
     server.on("/reboot", handleReboot);
     server.begin();
 
@@ -1315,18 +1348,7 @@ void setup() {
   } else {
     currentMode = MODE_LIVE;
     Serial.println("LIVE MODE");
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(wifiChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    if (esp_now_init() == ESP_OK) {
-      memcpy(peerInfo.peer_addr, receiverAddress, 6);
-      peerInfo.channel = wifiChannel;
-      peerInfo.encrypt = false;
-      if (!esp_now_is_peer_exist(receiverAddress))
-        esp_now_add_peer(&peerInfo);
-    }
+    // BLE måste initas före WiFi/ESP-NOW på ESP32-C3 (delar radio)
     NimBLEDevice::init("MIDI_PEDAL_PRO");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     NimBLEDevice::setSecurityAuth(false, false, false);
@@ -1342,6 +1364,32 @@ void setup() {
     NimBLEDevice::getAdvertising()->addServiceUUID(
         "03b80e5a-ede8-4b33-a751-6ce34ec4c700");
     NimBLEDevice::getAdvertising()->start();
+
+    // WiFi/ESP-NOW efter BLE — coex kräver denna ordning på ESP32-C3
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    esp_coex_preference_set(ESP_COEX_PREFER_BT);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    uint8_t dbgCh; wifi_second_chan_t dbgSec;
+    esp_wifi_get_channel(&dbgCh, &dbgSec);
+    Serial.printf("WiFi channel: %d\n", dbgCh);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    if (esp_now_init() == ESP_OK) {
+      esp_now_register_recv_cb(esp_now_recv_cb_t(OnPairingRecv));
+      memcpy(peerInfo.peer_addr, receiverAddress, 6);
+      peerInfo.channel = 1;
+      peerInfo.encrypt = false;
+      if (!esp_now_is_peer_exist(receiverAddress))
+        esp_now_add_peer(&peerInfo);
+      Serial.println("ESP-NOW OK");
+    } else {
+      Serial.println("ESP-NOW FAILED");
+    }
+
     for (int i = 0; i < 3; i++) {
       updateLed(true);
       delay(300);
@@ -1372,6 +1420,27 @@ void loop() {
         deviceConnected = false;
         updateLed(false); // Update to OFF
       }
+    }
+  }
+
+  // ESP-NOW discovery: skicka broadcast-ping tills Autostomp svarat
+  static const uint8_t bcastMac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  if (currentMode == MODE_LIVE && memcmp(receiverAddress, bcastMac, 6) == 0) {
+    static uint32_t lastPingMs = 0;
+    if (millis() - lastPingMs > 2000) {
+      lastPingMs = millis();
+      uint8_t bcast[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      esp_now_peer_info_t peer = {};
+      memcpy(peer.peer_addr, bcast, 6);
+      peer.channel = 1;
+      peer.encrypt = false;
+      if (!esp_now_is_peer_exist(bcast))
+        esp_now_add_peer(&peer);
+      struct_pairing ping;
+      ping.msgType = 99;
+      strncpy(ping.name, "MIDI-PEDAL-PRO", sizeof(ping.name) - 1);
+      esp_now_send(bcast, (uint8_t*)&ping, sizeof(ping));
+      Serial.println("ESP-NOW ping...");
     }
   }
 
