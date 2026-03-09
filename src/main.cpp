@@ -416,26 +416,19 @@ void sendToBLE(int type, int channel, int number, int value) {
 }
 
 void sendToESP(int type, int channel, int number, int value) {
-  myData.id = 1;
-  myData.type = type;
-  myData.number = number;
-  myData.value = value;
-  myData.channel = channel;
-  esp_now_send(receiverAddress, (uint8_t *)&myData, sizeof(myData));
-}
-
-void sendMidiClockByte(uint8_t msg) {
-  if (currentMode == MODE_LIVE && pCharacteristic != NULL) {
-    uint8_t pkt[] = {0x80, 0x80, msg};
-    pCharacteristic->setValue(pkt, 3);
-    pCharacteristic->notify();
+  uint8_t status = 0;
+  if (type == 0 || type == 2)      status = 0xB0;
+  else if (type == 1)              status = 0xC0;
+  else if (type == 5) status = (value > 0) ? 0x90 : 0x80;
+  if (status == 0) return;
+  status |= (channel - 1);
+  if (type == 1) {
+    uint8_t pkt[2] = {status, (uint8_t)number};
+    esp_now_send(receiverAddress, pkt, 2);
+  } else {
+    uint8_t pkt[3] = {status, (uint8_t)number, (uint8_t)value};
+    esp_now_send(receiverAddress, pkt, 3);
   }
-  myData.id = 1;
-  myData.type = 8;
-  myData.number = 0;
-  myData.value = msg;
-  myData.channel = 0;
-  esp_now_send(receiverAddress, (uint8_t *)&myData, sizeof(myData));
 }
 
 void updateMidiClock() {
@@ -444,7 +437,6 @@ void updateMidiClock() {
   unsigned long currentMicros = micros();
   if (currentMicros - lastClockMicros >= clockIntervalMicros) {
     lastClockMicros = currentMicros;
-    sendMidiClockByte(0xF8);
     clockTickCount++;
     if (clockTickCount >= 24) {
       clockTickCount = 0;
@@ -470,7 +462,6 @@ void registerTap() {
       currentBPM = (currentBPM * 0.4) + (newBPM * 0.6);
       clockIntervalMicros = 60000000 / (currentBPM * 24);
       if (!clockRunning) {
-        sendMidiClockByte(0xFA);
         clockRunning = true;
       }
     } else if (diff > 2000) {
