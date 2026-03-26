@@ -2,20 +2,217 @@
 #include "index_html.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Fonts/TomThumb.h>
 #include <DNSServer.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "esp_coexist.h"
 
+// --- OLED ---
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_ADDR  0x3C
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
+// Etiketter för varje knapp (index 0=btn1 … 3=btn4), max 20 tecken lagrat
+char btnLabel[4][21]   = {"", "", "", ""};
+char btnLabelLP[4][21] = {"", "", "", ""};
+char btnLabelDP[4][21] = {"", "", "", ""};
+// Etiketter för kombos (index 0=1+2, 1=2+3, 2=3+4)
+char comboLabel[3][21] = {"", "", ""};
+
+// Statusflaggor för rubrikrad
+static bool oled_bt  = false;  // BLE-klient ansluten
+static bool oled_esp = false;  // ESP-NOW har måladress
+static volatile bool oledNeedsUpdate = false;
+// Batteri: spänningsdelare på D10/GPIO9
+// Justera ADC_BAT_MIN/MAX för din delare (LiPo 3.0-4.2V)
+#define BAT_PIN     9
+#define ADC_BAT_MIN 1861  // ADC vid 1.5V (3.0V bat, 100k+100k delare)
+#define ADC_BAT_MAX 2607  // ADC vid 2.1V (4.2V bat, 100k+100k delare)
+static int oledBatBars = 10; // 0-10 staplar baserat på spänningskurva
+
+// Layout-konstanter
+// Header:      y=0..7   (streck vid y=7,  8px)
+// Knapprader:  y=8..53  → delat i mitten vid y=31 → 23px/22px per rad
+// Komborad:    y=54..63 → streck vid y=54, text vid y=61
+#define HDR_H  8    // innehåll startar här
+#define MID_Y  31   // horisontellt kors mellan knapprader
+#define CMB_Y  54   // överkant komborad (linje här)
+
+extern bool oledBtnPressed[];
+extern bool oledComboPressed[];
+struct ButtonConfig {
+  uint8_t type;
+  uint8_t mode;
+  uint8_t btCh;
+  uint8_t btVal;
+  uint8_t espCh;
+  uint8_t espVal;
+  uint8_t value;
+  bool lp_enabled;
+  uint8_t lp_type;
+  uint8_t lp_btCh;
+  uint8_t lp_btVal;
+  uint8_t lp_espCh;
+  uint8_t lp_espVal;
+  uint8_t lp_value;
+  bool dp_enabled;
+  uint8_t dp_type;
+  uint8_t dp_btCh;
+  uint8_t dp_btVal;
+  uint8_t dp_espCh;
+  uint8_t dp_espVal;
+  uint8_t dp_value;
+};
+extern ButtonConfig buttons[];
+enum Mode { MODE_LIVE, MODE_CONFIG };
+extern Mode currentMode;
+static void drawQuadrant(int btnIdx, int qx, int qy, int w, int h) {
+  bool inv = oledBtnPressed[btnIdx];
+  if (inv) oled.fillRect(qx, qy, w, h, SSD1306_WHITE);
+  oled.setTextColor(inv ? SSD1306_BLACK : SSD1306_WHITE);
+
+  int numFuncs = 1;
+  if (buttons[btnIdx].lp_enabled) numFuncs++;
+  if (buttons[btnIdx].dp_enabled) numFuncs++;
+
+  if (numFuncs == 1) {
+    // Stor text: inbyggd 5×7-font, vertikalt centrerad
+    oled.setFont(NULL);
+    oled.setTextSize(1);
+    oled.setCursor(qx + 1, qy + (h - 8) / 2);
+    oled.print(btnLabel[btnIdx]);
+  } else if (numFuncs == 2) {
+    // Medium: inbyggd 5×7-font, två rader centrerade i rutan
+    oled.setFont(NULL);
+    oled.setTextSize(1);
+    int y1 = qy + (h - 18) / 2;
+    oled.setCursor(qx + 1, y1);
+    oled.print(btnLabel[btnIdx]);
+    oled.setCursor(qx + 1, y1 + 10);
+    if (buttons[btnIdx].lp_enabled) oled.print(btnLabelLP[btnIdx]);
+    else                            oled.print(btnLabelDP[btnIdx]);
+  } else {
+    // Liten: TomThumb, tre rader (ascent≈5px, line height≈6px)
+    oled.setFont(&TomThumb);
+    oled.setTextSize(1);
+    oled.setCursor(qx + 1, qy + 6);  oled.print(btnLabel[btnIdx]);
+    if (buttons[btnIdx].lp_enabled)
+      { oled.setCursor(qx + 1, qy + 12); oled.print(btnLabelLP[btnIdx]); }
+    if (buttons[btnIdx].dp_enabled)
+      { oled.setCursor(qx + 1, qy + 18); oled.print(btnLabelDP[btnIdx]); }
+  }
+
+  // Återställ font för resten av oledDraw (combo-raden)
+  oled.setFont(&TomThumb);
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+void oledDraw() {
+  oled.clearDisplay();
+  oled.setFont(&TomThumb);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+
+  // === RUBRIKRAD (y=0..7, 8px) ===
+
+  // ESP-NOW: 3 signalstaplar, x=0..7, y=1..6 (6px)
+  if (oled_esp) {
+    oled.fillRect(0, 5, 2, 2, SSD1306_WHITE);
+    oled.fillRect(3, 3, 2, 4, SSD1306_WHITE);
+    oled.fillRect(6, 1, 2, 6, SSD1306_WHITE);
+  } else {
+    oled.drawRect(0, 5, 2, 2, SSD1306_WHITE);
+    oled.drawRect(3, 3, 2, 4, SSD1306_WHITE);
+    oled.drawRect(6, 1, 2, 6, SSD1306_WHITE);
+  }
+
+  // Bluetooth: lodrätt + gaffellinjer, x=106..108, y=1..6
+  oled.drawLine(106, 1, 106, 6, SSD1306_WHITE);
+  if (oled_bt) {
+    oled.drawLine(106, 1, 108, 2, SSD1306_WHITE);
+    oled.drawLine(108, 2, 106, 4, SSD1306_WHITE);
+    oled.drawLine(106, 4, 108, 5, SSD1306_WHITE);
+    oled.drawLine(108, 5, 106, 6, SSD1306_WHITE);
+  }
+
+  // WiFi: visas bara i setup-läge
+  if (currentMode == MODE_CONFIG) {
+    oled.fillCircle(94, 6, 1, SSD1306_WHITE);
+    oled.drawCircle(94, 6, 3, SSD1306_WHITE);
+    oled.drawCircle(94, 6, 5, SSD1306_WHITE);
+    oled.fillRect(86, 7, 17, 7, SSD1306_BLACK);
+  }
+
+  // Batteri, x=113..124, y=1..6 (inneryta 10×4px, 1 pixel = 10%)
+  oled.drawRect(113, 1, 12, 6, SSD1306_WHITE);
+  oled.drawRect(125, 2,  2, 4, SSD1306_WHITE);
+  { int fill = oledBatBars;
+    if (fill > 0) oled.fillRect(114, 2, fill, 4, SSD1306_WHITE); }
+
+  // Rubriktext centrerad
+  { const char* modeStr = (currentMode == 1) ? "Setup" : "Live";
+    int16_t x1, y1; uint16_t tw, th;
+    oled.getTextBounds(modeStr, 0, 6, &x1, &y1, &tw, &th);
+    oled.setCursor((OLED_WIDTH - tw) / 2, 6);
+    oled.print(modeStr); }
+
+  // Rubrikstreck
+  oled.drawFastHLine(0, 7, OLED_WIDTH, SSD1306_WHITE);
+
+  // === KNAPPRADER (y=HDR_H..CMB_Y-1) ===
+  // Horisontellt kors vid MID_Y, lodrätt x=64 från HDR_H till CMB_Y
+  oled.drawFastHLine(0, MID_Y, OLED_WIDTH, SSD1306_WHITE);
+  oled.drawFastVLine(OLED_WIDTH / 2, HDR_H, CMB_Y - HDR_H, SSD1306_WHITE);
+  // btn2=uppe-vänster  btn3=uppe-höger
+  // btn1=nere-vänster  btn4=nere-höger
+  drawQuadrant(1,  0, HDR_H,    63, MID_Y - HDR_H);
+  drawQuadrant(2, 65, HDR_H,    63, MID_Y - HDR_H);
+  drawQuadrant(0,  0, MID_Y+1,  63, CMB_Y - MID_Y - 1);
+  drawQuadrant(3, 65, MID_Y+1,  63, CMB_Y - MID_Y - 1);
+
+  // === KOMBORAD (y=CMB_Y..63) ===
+  oled.drawFastHLine(0, CMB_Y, OLED_WIDTH, SSD1306_WHITE);
+  // 2 lodräta delare: x=42 och x=85
+  oled.drawFastVLine(42, CMB_Y, OLED_HEIGHT - CMB_Y, SSD1306_WHITE);
+  oled.drawFastVLine(85, CMB_Y, OLED_HEIGHT - CMB_Y, SSD1306_WHITE);
+  // Combo-celler: fyll vit + svart text när aktiv
+  int cmbX[3] = {0, 43, 86};
+  int cmbW[3] = {42, 42, 42};
+  for (int i = 0; i < 3; i++) {
+    if (oledComboPressed[i]) oled.fillRect(cmbX[i], CMB_Y+1, cmbW[i], OLED_HEIGHT-CMB_Y-1, SSD1306_WHITE);
+    oled.setTextColor(oledComboPressed[i] ? SSD1306_BLACK : SSD1306_WHITE);
+    oled.setCursor(cmbX[i]+1, CMB_Y+7); oled.print(comboLabel[i]);
+  }
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.display();
+}
+
+void oledInit() {
+  Wire.begin(5, 6); // SDA=GPIO5, SCL=GPIO6
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED: begin failed");
+    return;
+  }
+  oledDraw();
+  Serial.println("OLED: OK");
+}
+
 // --- KONFIGURATION ---
 const int NUM_BUTTONS = 4;
 const int NUM_COMBOS = 3; // 1+2, 2+3, 3+4
-const int btnPins[NUM_BUTTONS] = {2, 3, 4, 5};
-const int ledPin = 8;
+const int btnPins[NUM_BUTTONS] = {1, 2, 3, 4};
+const int ledPin = 7;
 int wifiChannel = 1;        // Current WiFi channel (1-11)
 int autoChannelEnabled = 1; // 0 = manual, 1 = auto-scan
 
@@ -25,34 +222,6 @@ unsigned long longPressTime = 1500;  // Standard 1500ms
 const unsigned long comboDelay = 45; // HUR LÄNGE VI VÄNTAR PÅ COMBO (ms)
 
 // --- DATASTRUKTURER ---
-struct ButtonConfig {
-  // SHORT PRESS (Standard / Combo Action)
-  uint8_t type; // 0=CC, 1=PC, 2=TAP, 3=CLK, 4=CC+, 5=NOTE
-  uint8_t mode; // 0=Trigger, 1=Momentary, 2=Latch
-  uint8_t btCh;
-  uint8_t btVal;
-  uint8_t espCh;
-  uint8_t espVal;
-  uint8_t value;
-
-  // LONG PRESS
-  bool lp_enabled;
-  uint8_t lp_type;
-  uint8_t lp_btCh;
-  uint8_t lp_btVal;
-  uint8_t lp_espCh;
-  uint8_t lp_espVal;
-  uint8_t lp_value;
-
-  // DOUBLE PRESS
-  bool dp_enabled;
-  uint8_t dp_type;
-  uint8_t dp_btCh;
-  uint8_t dp_btVal;
-  uint8_t dp_espCh;
-  uint8_t dp_espVal;
-  uint8_t dp_value;
-};
 
 // Vi återanvänder ButtonConfig structen men använder bara "Short Press" delen
 // för combos
@@ -95,6 +264,10 @@ String foundName = "";
 uint8_t foundMAC[6];
 esp_now_peer_info_t peerInfo;
 
+// Deferred save: NVS-skrivning från WiFi-callback är osäker — gör det i loop() istället
+static volatile bool s_saveReceiverPending = false;
+static uint8_t       s_pendingReceiver[6]  = {};
+
 NimBLECharacteristic *pCharacteristic = NULL;
 NimBLEServer *pGlobalServer = NULL; // GLOBAL SERVER INSTANCE
 Preferences preferences;
@@ -129,14 +302,18 @@ void blinkLedFast() {
 }
 
 class MyServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer *pServer) {
+  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
     Serial.println("BLE Device Connected");
     deviceConnected = true;
+    oled_bt = true;
+    oledNeedsUpdate = true;
     updateLed(false);
-  };
-  void onDisconnect(NimBLEServer *pServer) {
+  }
+  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
     Serial.println("BLE Device Disconnected");
     deviceConnected = false;
+    oled_bt = false;
+    oledNeedsUpdate = true;
     updateLed(false);
     NimBLEDevice::getAdvertising()->start();
   }
@@ -180,6 +357,8 @@ enum BtnState {
 BtnState btnState[NUM_BUTTONS] = {IDLE};
 unsigned long stateTimer[NUM_BUTTONS] = {0};
 bool activeWasStandard[NUM_BUTTONS] = {false};
+bool oledBtnPressed[NUM_BUTTONS] = {false};
+bool oledComboPressed[3] = {false};
 
 // Debounce-variabler
 int stableState[NUM_BUTTONS] = {HIGH, HIGH, HIGH, HIGH};
@@ -208,7 +387,6 @@ bool tempoModeActive = false;
 unsigned long tempoModeExitTimer = 0;
 int tempoModeButtonIndex = -1;
 
-enum Mode { MODE_LIVE, MODE_CONFIG };
 Mode currentMode;
 
 extern const char *htmlPage;
@@ -226,13 +404,18 @@ void enterStandby() {
   Serial.println("Går in i Standby (Deep Sleep)...");
   // Tre tydliga blink (Full ljusstyrka)
   for (int i = 0; i < 3; i++) {
-    ledcWrite(PWM_CHAN, 255); // ON
+    ledcWrite(PWM_CHAN, 255);
     delay(300);
-    ledcWrite(PWM_CHAN, 0); // OFF
+    ledcWrite(PWM_CHAN, 0);
     delay(300);
   }
-  uint64_t mask = (1ULL << btnPins[0]) | (1ULL << btnPins[3]);
-  esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Släck OLED
+  oled.clearDisplay();
+  oled.display();
+  oled.ssd1306_command(SSD1306_DISPLAYOFF);
+  gpio_wakeup_enable((gpio_num_t)btnPins[0], GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)btnPins[3], GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
   esp_deep_sleep_start();
 }
 
@@ -250,8 +433,8 @@ void checkSystemCombos() {
       bothHeldStart = millis();
       waitingForSetupRelease = true; // Mark att vi börjat hålla in båda
     } else {
-      // Om vi hållit in båda i mer än 1500ms -> STANDBY
-      if (millis() - bothHeldStart > 1500) {
+      // Om vi hållit in båda i mer än 500ms -> STANDBY
+      if (millis() - bothHeldStart > 500) {
         enterStandby();
       }
     }
@@ -329,6 +512,20 @@ void loadActiveSettings() {
   wifiChannel = preferences.getInt("wifi_ch", 1);
   autoChannelEnabled = preferences.getInt("auto_ch", 1);
 
+  // Ladda OLED-etiketter
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    String val = preferences.getString(("lbl"  + String(i + 1)).c_str(), "");
+    strncpy(btnLabel[i], val.c_str(), 20); btnLabel[i][20] = '\0';
+    val = preferences.getString(("llp" + String(i + 1)).c_str(), "");
+    strncpy(btnLabelLP[i], val.c_str(), 20); btnLabelLP[i][20] = '\0';
+    val = preferences.getString(("ldp" + String(i + 1)).c_str(), "");
+    strncpy(btnLabelDP[i], val.c_str(), 20); btnLabelDP[i][20] = '\0';
+  }
+  for (int i = 0; i < NUM_COMBOS; i++) {
+    String val = preferences.getString(("lcmb" + String(i + 1)).c_str(), "");
+    strncpy(comboLabel[i], val.c_str(), 20); comboLabel[i][20] = '\0';
+  }
+
   preferences.end();
   checkMidiClockStatus();
 }
@@ -341,6 +538,13 @@ void saveActiveToNVS() {
   preferences.putUInt("lp_time", longPressTime);
   preferences.putInt("wifi_ch", wifiChannel);
   preferences.putInt("auto_ch", autoChannelEnabled);
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    preferences.putString(("lbl"  + String(i + 1)).c_str(), String(btnLabel[i]));
+    preferences.putString(("llp"  + String(i + 1)).c_str(), String(btnLabelLP[i]));
+    preferences.putString(("ldp"  + String(i + 1)).c_str(), String(btnLabelDP[i]));
+  }
+  for (int i = 0; i < NUM_COMBOS; i++)
+    preferences.putString(("lcmb" + String(i + 1)).c_str(), String(comboLabel[i]));
   preferences.end();
   checkMidiClockStatus();
 }
@@ -548,8 +752,14 @@ String generateButtonCards() {
   String html = "";
   for (int i = 0; i < NUM_BUTTONS; i++) {
     String n = String(i + 1);
-    html +=
-        "<div class='btn-card'><div class='btn-header'>BUTTON " + n + "</div>";
+    html += "<div id='tab_" + n + "' class='tab-panel'>";
+    html += "<div class='btn-card'><div class='btn-header'>BUTTON " + n + "</div>";
+
+    html += "<div class='settings-row'><div class='input-group' style='width:100%'>"
+            "<label>OLED Label</label>"
+            "<input name='lbl" + n + "' maxlength='20' value='" +
+            String(btnLabel[i]) + "' onchange='sendData(this)' "
+            "style='width:100%;box-sizing:border-box'></div></div>";
 
     html += "<div class='settings-row'><div "
             "class='input-group'><label>Type</label><select name='t" +
@@ -628,7 +838,12 @@ String generateButtonCards() {
             "' onchange='sendData(this)'>";
     html += " # <input class='sm' name='lpve" + n + "' value='" +
             String(buttons[i].lp_espVal) +
-            "' onchange='sendData(this)'></span></div></div>";
+            "' onchange='sendData(this)'></span></div>";
+    html += "<div class='settings-row'><div class='input-group' style='width:100%'>"
+            "<label>OLED Label</label>"
+            "<input name='llp" + n + "' maxlength='20' value='" +
+            String(btnLabelLP[i]) + "' onchange='sendData(this)' "
+            "style='width:100%;box-sizing:border-box'></div></div></div>";
 
     String dp_checked = buttons[i].dp_enabled ? "checked" : "";
     String dp_display = buttons[i].dp_enabled ? "block" : "none";
@@ -664,9 +879,14 @@ String generateButtonCards() {
             "' onchange='sendData(this)'>";
     html += " # <input class='sm' name='dpve" + n + "' value='" +
             String(buttons[i].dp_espVal) +
-            "' onchange='sendData(this)'></span></div></div>";
+            "' onchange='sendData(this)'></span></div>";
+    html += "<div class='settings-row'><div class='input-group' style='width:100%'>"
+            "<label>OLED Label</label>"
+            "<input name='ldp" + n + "' maxlength='20' value='" +
+            String(btnLabelDP[i]) + "' onchange='sendData(this)' "
+            "style='width:100%;box-sizing:border-box'></div></div></div>";
 
-    html += "</div>";
+    html += "</div></div>"; // stänger btn-card + tab-panel
   }
 
   for (int i = 0; i < NUM_COMBOS; i++) {
@@ -675,6 +895,7 @@ String generateButtonCards() {
     String c_checked = combos[i].enabled ? "checked" : "";
     String c_display = combos[i].enabled ? "block" : "none";
 
+    html += "<div id='tab_c" + n + "' class='tab-panel'>";
     html += "<div class='btn-card' style='border-color:#9C27B0'>";
     html += "<div class='btn-header' style='color:#E040FB'>COMBO " + label +
             " <input type='checkbox' style='float:right' "
@@ -719,7 +940,12 @@ String generateButtonCards() {
     html += " # <input class='sm' name='cve" + n + "' value='" +
             String(combos[i].espVal) +
             "' onchange='sendData(this)'></span></div>";
-    html += "</div></div>";
+    html += "<div class='settings-row'><div class='input-group' style='width:100%'>"
+            "<label>OLED Label</label>"
+            "<input name='lcmb" + n + "' maxlength='20' value='" +
+            String(comboLabel[i]) + "' onchange='sendData(this)' "
+            "style='width:100%;box-sizing:border-box'></div></div>";
+    html += "</div></div></div>"; // stänger c_box + btn-card + tab-panel
   }
 
   return html;
@@ -852,7 +1078,22 @@ void handleSave() {
       combos[i].value = server.arg("cv" + n).toInt();
   }
 
+  auto parseLabel = [&](const String& key, char* dst) {
+    if (server.hasArg(key)) {
+      String val = server.arg(key).substring(0, 20);
+      strncpy(dst, val.c_str(), 20); dst[20] = '\0';
+    }
+  };
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    parseLabel("lbl"  + String(i + 1), btnLabel[i]);
+    parseLabel("llp"  + String(i + 1), btnLabelLP[i]);
+    parseLabel("ldp"  + String(i + 1), btnLabelDP[i]);
+  }
+  for (int i = 0; i < NUM_COMBOS; i++)
+    parseLabel("lcmb" + String(i + 1), comboLabel[i]);
+
   saveActiveToNVS();
+  oledDraw();
   server.send(200, "text/plain", "OK");
 }
 
@@ -991,25 +1232,33 @@ void OnPairingRecv(const uint8_t *mac_addr, const uint8_t *incomingData,
   if (len != sizeof(pairingData)) return;
   memcpy(&pairingData, incomingData, sizeof(pairingData));
   if (pairingData.msgType == 1) {
-    // CONFIG MODE: Autostomp svarade på vår scan
+    // Autostomp svarade på vår scan
     newDeviceFound = true;
     memcpy(foundMAC, mac_addr, 6);
     foundName = String(pairingData.name);
-  } else if (pairingData.msgType == 1) {
-    // LIVE MODE: Autostomp svarade på vår ping — spara MAC
-    memcpy(receiverAddress, mac_addr, 6);
+    memcpy(s_pendingReceiver, mac_addr, 6);
+    s_saveReceiverPending = true;  // spara i loop() istället för här
+    Serial.printf("Autostomp found: %02X:%02X:%02X:%02X:%02X:%02X\n",
+      mac_addr[0],mac_addr[1],mac_addr[2],mac_addr[3],mac_addr[4],mac_addr[5]);
+  } else if (pairingData.msgType == 99) {
+    // Autostomp scannar efter oss — svara och schemalägga sparning
     memcpy(foundMAC, mac_addr, 6);
     newDeviceFound = true;
-    preferences.begin("midi_cfg", false);
-    preferences.putBytes("rx", receiverAddress, 6);
-    preferences.end();
+    memcpy(s_pendingReceiver, mac_addr, 6);
+    s_saveReceiverPending = true;  // spara i loop() istället för här
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac_addr, 6);
     peer.channel = 1;
+    peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     if (!esp_now_is_peer_exist(mac_addr))
       esp_now_add_peer(&peer);
-    Serial.printf("Autostomp found: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    struct_pairing resp;
+    resp.msgType = 1;
+    strncpy(resp.name, "MIDI-PEDAL-PRO", sizeof(resp.name) - 1);
+    resp.name[sizeof(resp.name) - 1] = '\0';
+    esp_now_send(mac_addr, (uint8_t*)&resp, sizeof(resp));
+    Serial.printf("Svarade på Autostomp-scan: %02X:%02X:%02X:%02X:%02X:%02X\n",
       mac_addr[0],mac_addr[1],mac_addr[2],mac_addr[3],mac_addr[4],mac_addr[5]);
   }
 }
@@ -1102,6 +1351,8 @@ void checkCombos() {
         }
         comboActive[i] = false;
         comboWasStandard[i] = false;
+        oledComboPressed[i] = false;
+        oledDraw();
         // Återställ till IDLE så att "release" i checkButton inte flippar ur
         btnState[btnA] = IDLE;
         btnState[btnB] = IDLE;
@@ -1134,6 +1385,10 @@ void checkCombos() {
         triggerComboAction(i, true);
         comboActive[i] = true;
         comboWasStandard[i] = true;
+        oledBtnPressed[btnA] = false;
+        oledBtnPressed[btnB] = false;
+        oledComboPressed[i] = true;
+        oledDraw();
 
         btnState[btnA] = BLOCKED_BY_COMBO;
         btnState[btnB] = BLOCKED_BY_COMBO;
@@ -1156,6 +1411,8 @@ void checkButton(int btnIndex) {
   if ((now - lastDebounceTime[btnIndex]) > debounceDelay) {
     if (reading != stableState[btnIndex]) {
       stableState[btnIndex] = reading;
+      oledBtnPressed[btnIndex] = (reading == LOW);
+      oledDraw();
 
       // --- PRESS (HIGH -> LOW) ---
       if (stableState[btnIndex] == LOW) {
@@ -1306,13 +1563,16 @@ void setup() {
         updateLed(false);
         delay(30);
       }
-      uint64_t mask = (1ULL << btnPins[0]) | (1ULL << btnPins[3]);
-      esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+      gpio_wakeup_enable((gpio_num_t)btnPins[0], GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)btnPins[3], GPIO_INTR_LOW_LEVEL);
+      esp_sleep_enable_gpio_wakeup();
       esp_deep_sleep_start();
     }
   }
 
   loadActiveSettings();
+  { static const uint8_t bcast[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    oled_esp = (memcmp(receiverAddress, bcast, 6) != 0); }
   initAutostompPreset(); // Initialize Autostomp preset if it doesn't exist
   preferences.begin("midi_cfg", false);
   bool forceConfig = preferences.getBool("force_cfg", false);
@@ -1343,6 +1603,7 @@ void setup() {
     server.on("/reboot", handleReboot);
     server.begin();
 
+    oledInit();
     // Tre långsamma fadeande blink vid start av setup
     fadeLed(3, 10);
   } else {
@@ -1350,6 +1611,7 @@ void setup() {
     Serial.println("LIVE MODE");
     // BLE måste initas före WiFi/ESP-NOW på ESP32-C3 (delar radio)
     NimBLEDevice::init("MIDI_PEDAL_PRO");
+    NimBLEDevice::deleteAllBonds(); // Rensa gamla bonds — ska inte visas i iOS BT-inställningar
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     NimBLEDevice::setSecurityAuth(false, false, false);
     pGlobalServer = NimBLEDevice::createServer();
@@ -1361,27 +1623,24 @@ void setup() {
                                                     NIMBLE_PROPERTY::NOTIFY |
                                                     NIMBLE_PROPERTY::WRITE_NR);
     pService->start();
-    NimBLEDevice::getAdvertising()->addServiceUUID(
-        "03b80e5a-ede8-4b33-a751-6ce34ec4c700");
+    NimBLEDevice::getAdvertising()->addServiceUUID("03b80e5a-ede8-4b33-a751-6ce34ec4c700");
     NimBLEDevice::getAdvertising()->start();
 
     // WiFi/ESP-NOW efter BLE — coex kräver denna ordning på ESP32-C3
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true);
     esp_coex_preference_set(ESP_COEX_PREFER_BT);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
-    uint8_t dbgCh; wifi_second_chan_t dbgSec;
-    esp_wifi_get_channel(&dbgCh, &dbgSec);
-    Serial.printf("WiFi channel: %d\n", dbgCh);
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    // WIFI_PS_NONE aborterar om BLE är igång på ESP32-C3 — använd MIN_MODEM
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     if (esp_now_init() == ESP_OK) {
       esp_now_register_recv_cb(esp_now_recv_cb_t(OnPairingRecv));
       memcpy(peerInfo.peer_addr, receiverAddress, 6);
       peerInfo.channel = 1;
+      peerInfo.ifidx = WIFI_IF_STA;
       peerInfo.encrypt = false;
       if (!esp_now_is_peer_exist(receiverAddress))
         esp_now_add_peer(&peerInfo);
@@ -1390,6 +1649,7 @@ void setup() {
       Serial.println("ESP-NOW FAILED");
     }
 
+    oledInit();
     for (int i = 0; i < 3; i++) {
       updateLed(true);
       delay(300);
@@ -1400,11 +1660,34 @@ void setup() {
 }
 
 void loop() {
+  // Batteriavläsning var 10:e sekund
+  static unsigned long lastBatCheck = 0;
+  unsigned long nowMs = millis();
+  if (nowMs - lastBatCheck > 10000) {
+    lastBatCheck = nowMs;
+    int raw = analogRead(BAT_PIN);
+    float v = 3.0f + (float)(raw - ADC_BAT_MIN) * 1.2f / (ADC_BAT_MAX - ADC_BAT_MIN);
+    int bars;
+    if      (v >= 4.15f) bars = 10;
+    else if (v >= 4.08f) bars = 9;
+    else if (v >= 4.00f) bars = 8;
+    else if (v >= 3.92f) bars = 7;
+    else if (v >= 3.86f) bars = 6;
+    else if (v >= 3.80f) bars = 5;
+    else if (v >= 3.74f) bars = 4;
+    else if (v >= 3.68f) bars = 3;
+    else if (v >= 3.58f) bars = 2;
+    else if (v >= 3.45f) bars = 1;
+    else                 bars = 0;
+    if (bars != oledBatBars) { oledBatBars = bars; oledDraw(); }
+  }
+
   if (currentMode == MODE_CONFIG) {
     dnsServer.processNextRequest();
     server.handleClient();
     breathingLed(); // "Andas" i setup-läge
   }
+  if (oledNeedsUpdate) { oledNeedsUpdate = false; oledDraw(); }
   checkSystemCombos();
   updateMidiClock();
 
@@ -1421,6 +1704,30 @@ void loop() {
         updateLed(false); // Update to OFF
       }
     }
+  }
+
+  // Spara Autostomps MAC i NVS (deferred från WiFi-callback)
+  if (s_saveReceiverPending) {
+    s_saveReceiverPending = false;
+    memcpy(receiverAddress, s_pendingReceiver, 6);
+    preferences.begin("midi_cfg", false);
+    preferences.putBytes("rx", receiverAddress, 6);
+    preferences.end();
+    // Uppdatera ESP-NOW peer: ta bort broadcast, lägg till rätt adress
+    uint8_t bcast[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    if (esp_now_is_peer_exist(bcast)) esp_now_del_peer(bcast);
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, receiverAddress, 6);
+    peer.channel = 1;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    if (!esp_now_is_peer_exist(receiverAddress))
+      esp_now_add_peer(&peer);
+    Serial.printf("Autostomp MAC sparad: %02X:%02X:%02X:%02X:%02X:%02X\n",
+      receiverAddress[0],receiverAddress[1],receiverAddress[2],
+      receiverAddress[3],receiverAddress[4],receiverAddress[5]);
+    oled_esp = true;
+    oledDraw();
   }
 
   // ESP-NOW discovery: skicka broadcast-ping tills Autostomp svarat
